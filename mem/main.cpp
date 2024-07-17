@@ -1,6 +1,5 @@
 #include <iostream>
 #include <fstream>
-#include <sstream>
 #include <Windows.h>
 #include <TlHelp32.h>
 #include <Psapi.h>
@@ -9,7 +8,8 @@ using namespace std;
 
 #pragma comment(lib, "psapi.lib")
 
-string GetProtectionString(DWORD protect) {
+// func to map memory protection constants to readable strings
+string convertProtectionToString(DWORD protect) {
     if (protect & PAGE_NOACCESS)
         return "No Access";
     else if (protect & PAGE_READONLY)
@@ -30,95 +30,95 @@ string GetProtectionString(DWORD protect) {
         return "Unknown";
 }
 
-void EnumerateMemoryRegionsToFile(const string& exeName) {
-    stringstream brah;
-    brah << "memory regions for executable " << exeName << ":\n";
+// func to find process ID by exec name
+DWORD findProcessID(const string& exeName) {
+    DWORD pid = 0;
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(pe32);
 
-    wstring wideExeName(exeName.begin(), exeName.end());
-
-    DWORD processId = 0;
-    PROCESSENTRY32 entry;
-    entry.dwSize = sizeof(entry);
-
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot != INVALID_HANDLE_VALUE) {
-        if (Process32First(snapshot, &entry)) {
-            do {
-                wstring wideEntryName(entry.szExeFile, entry.szExeFile + strlen(entry.szExeFile) + 1);
-
-                if (_wcsicmp(wideEntryName.c_str(), wideExeName.c_str()) == 0) {
-                    processId = entry.th32ProcessID;
-                    brah << "PID: " << processId << "\n";
-                    break;
-                }
-            } while (Process32Next(snapshot, &entry));
-        }
-        CloseHandle(snapshot);
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        cerr << "Error: Unable to create toolhelp snapshot" << endl;
+        return 0;
     }
 
-    if (processId == 0) {
-        cerr << "failed to find process for executable " << exeName << "\n";
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            if (_stricmp(pe32.szExeFile, exeName.c_str()) == 0) {
+                pid = pe32.th32ProcessID;
+                break;
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+    else {
+        cerr << "Error: Unable to get the first process" << endl;
+    }
+
+    CloseHandle(hSnapshot);
+    return pid;
+}
+
+// main func to enum memory regions and write to file
+void EnumerateMemoryAndWriteToFile(const string& exeName) {
+    string output;
+    output += "Memory regions for executable " + exeName + ":\n";
+
+    DWORD pid = findProcessID(exeName);
+    if (pid == 0) {
+        cerr << "Failed to find process for executable: " << exeName << endl;
         return;
     }
 
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
     if (hProcess == nullptr) {
-        cerr << "failed to open process for executable " << exeName << "\n";
+        cerr << "Failed to open process for executable: " << exeName << endl;
         return;
     }
 
     ofstream file("memoenum.txt");
     if (!file.is_open()) {
-        cerr << "unable to open file memoenum.txt\n";
+        cerr << "Unable to open file: memoenum.txt" << endl;
         CloseHandle(hProcess);
         return;
     }
 
-    MODULEENTRY32 moduleEntry;
-    moduleEntry.dwSize = sizeof(moduleEntry);
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
 
-    SYSTEM_INFO systemInfo;
-    GetSystemInfo(&systemInfo);
+    // start at the minimum application address
+    uintptr_t address = reinterpret_cast<uintptr_t>(sysInfo.lpMinimumApplicationAddress);
 
-    uintptr_t address = reinterpret_cast<uintptr_t>(systemInfo.lpMinimumApplicationAddress);
-
-    while (address < reinterpret_cast<uintptr_t>(systemInfo.lpMaximumApplicationAddress)) {
+    // iterate over memory regions
+    while (address < reinterpret_cast<uintptr_t>(sysInfo.lpMaximumApplicationAddress)) {
         MEMORY_BASIC_INFORMATION memInfo;
         if (VirtualQueryEx(hProcess, reinterpret_cast<LPCVOID>(address), &memInfo, sizeof(memInfo)) == sizeof(memInfo)) {
-            TCHAR szModule[MAX_PATH];
-            if (::GetModuleFileNameEx(hProcess, (HMODULE)memInfo.AllocationBase, szModule, MAX_PATH)) {
-                brah << "Base Address: " << reinterpret_cast<void*>(memInfo.BaseAddress)
-                    << "; Region Size: " << memInfo.RegionSize << " bytes"
-                    << "; Allocation Protect: " << GetProtectionString(memInfo.AllocationProtect)
-                    << "; Module Name: " << szModule
-                    << "\n";
-            }
-            else {
-                brah << "Base Address: " << reinterpret_cast<void*>(memInfo.BaseAddress)
-                    << "; Region Size: " << memInfo.RegionSize << " bytes"
-                    << "; Allocation Protect: " << GetProtectionString(memInfo.AllocationProtect)
-                    << "; Module Name: Unknown"
-                    << "\n";
-            }
+            char moduleName[MAX_PATH] = "Unknown";
+            GetModuleFileNameExA(hProcess, (HMODULE)memInfo.AllocationBase, moduleName, MAX_PATH);
+
+            output += "Base Address: " + to_string(reinterpret_cast<uintptr_t>(memInfo.BaseAddress)) +
+                "; Region Size: " + to_string(memInfo.RegionSize) + " bytes" +
+                "; Allocation Protect: " + convertProtectionToString(memInfo.AllocationProtect) +
+                "; Module Name: " + string(moduleName) + "\n";
+
             address += memInfo.RegionSize;
         }
         else {
-            address += systemInfo.dwPageSize;
+            address += sysInfo.dwPageSize;
         }
     }
 
-    file << brah.str();
+    file << output;
     file.close();
     CloseHandle(hProcess);
-    cout << "memory regions written to memoenum.txt\n";
+    cout << "Memory regions written to memoenum.txt" << endl;
 }
 
 int main() {
     string exeName;
-    cout << "enter the executable filename (e.g., Discord.exe): ";
+    cout << "Enter the executable filename (e.g., Discord.exe): ";
     getline(cin, exeName);
 
-    EnumerateMemoryRegionsToFile(exeName);
+    EnumerateMemoryAndWriteToFile(exeName);
 
     return 0;
 }
